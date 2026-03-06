@@ -5,7 +5,7 @@ Displacement
 A hybrid machine learning app for predicting seismic-induced lateral displacement,
 combining ground motion intensity measures with knowledge-based empirical model outputs.
 
-[![Streamlit App](https://static.streamlit.io/badges/streamlit_badge_black_white.svg)](https://your-app-url.streamlit.app)
+den-fl-2026-qjq94td8mtpcq4psscopcn.streamlit.app
 
 ---
 
