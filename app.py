@@ -1,527 +1,693 @@
-"""
-app.py  —  Seismic Displacement Predictor
-Hybrid ML + Knowledge-Based Model
+# ── app.py — Seismic Lateral Displacement Prediction (Three-Tier Hybrid ML)
+# ── Parisa Hajibabaee | Florida Polytechnic University
 
-Fully dynamic — all feature names, model info, and training data
-are read directly from the pkl files. Nothing is hardcoded.
-"""
-
-import streamlit as st
 import numpy as np
 import pandas as pd
-import pickle
+import streamlit as st
 import matplotlib.pyplot as plt
 import shap
-import io
-from sklearn.ensemble import GradientBoostingRegressor
+from sklearn.ensemble import GradientBoostingRegressor, RandomForestRegressor
+from sklearn.model_selection import LeaveOneOut
+from sklearn.metrics import r2_score, mean_squared_error, mean_absolute_error
+from xgboost import XGBRegressor
 
-# ══════════════════════════════════════════════════════════════
-# PAGE CONFIG
-# ══════════════════════════════════════════════════════════════
+# ─────────────────────────────────────────────
+# CONSTANTS
+# ─────────────────────────────────────────────
+FILE_PATH  = "DATA-ML v03-Parisa.xlsx"
+FC         = 0.007
+Dr         = 500
+g          = 9.81
+
+RAW_FEATURES = [
+    "M", "R", "Max_Acc", "Max_Vel", "Arias", "Char_Int",
+    "CAV", "Housner", "Sa_avg", "SaT", "Ia_Du",
+    "ru_max_ave", "Shear_strain"
+]
+
+TOP6 = ["CAV", "Arias", "Shear_strain", "Housner", "Sa_avg", "M"]
+
+FEATURE_LABELS = {
+    "M":           "Magnitude (M)",
+    "R":           "Distance R (km)",
+    "Max_Acc":     "Peak Ground Acceleration (g)",
+    "Max_Vel":     "Peak Ground Velocity (cm/s)",
+    "Arias":       "Arias Intensity (m/s)",
+    "Char_Int":    "Characteristic Intensity",
+    "CAV":         "Cumul. Abs. Velocity — CAV (cm/s)",
+    "Housner":     "Housner Intensity (cm)",
+    "Sa_avg":      "Average Spectral Accel. Sa_avg (g)",
+    "SaT":         "Spectral Accel. at T — SaT (g)",
+    "Ia_Du":       "Arias Intensity Duration Ia_Du",
+    "ru_max_ave":  "Max Excess Pore Pressure Ratio ru",
+    "Shear_strain":"Maximum Shear Strain (%)",
+}
+
+FEATURE_DEFAULTS = {
+    "M": 6.5, "R": 10.0, "Max_Acc": 0.3, "Max_Vel": 30.0,
+    "Arias": 1.5, "Char_Int": 0.5, "CAV": 800.0, "Housner": 80.0,
+    "Sa_avg": 0.4, "SaT": 0.5, "Ia_Du": 0.8,
+    "ru_max_ave": 0.7, "Shear_strain": 2.5,
+}
+
+FEATURE_RANGES = {
+    "M":           (4.0, 9.0, 0.01),
+    "R":           (0.1, 200.0, 0.1),
+    "Max_Acc":     (0.01, 2.0, 0.001),
+    "Max_Vel":     (0.1, 300.0, 0.1),
+    "Arias":       (0.001, 20.0, 0.001),
+    "Char_Int":    (0.001, 5.0, 0.001),
+    "CAV":         (10.0, 5000.0, 1.0),
+    "Housner":     (1.0, 500.0, 0.1),
+    "Sa_avg":      (0.01, 3.0, 0.001),
+    "SaT":         (0.01, 3.0, 0.001),
+    "Ia_Du":       (0.001, 5.0, 0.001),
+    "ru_max_ave":  (0.0, 1.0, 0.001),
+    "Shear_strain":(0.001, 20.0, 0.001),
+}
+
+# ─────────────────────────────────────────────
+# EMPIRICAL FORMULAS
+# ─────────────────────────────────────────────
+def compute_song2015(M, R, Max_Acc, Max_Vel, Arias, Char_Int,
+                     CAV, Housner, Sa_avg, SaT, Ia_Du, ru_max_ave, Shear_strain):
+    try:
+        val = np.exp(
+            -8.436 - 3.195*np.log(FC) - 0.346*np.log(FC)**2
+            + 1.579*np.log(SaT) + 0.393*np.log(FC)*np.log(SaT)
+            - 0.136*np.log(SaT)**2 + 1.542*np.log(Max_Vel) + 0.112*0.1
+        )
+        return max(val, 0)
+    except:
+        return 0.0
+
+def compute_all_kms(row):
+    M_v  = row["M"];       R_v  = row["R"]
+    D    = row["Max_Acc"]; E    = row["Max_Vel"]
+    F    = row["Arias"];   K    = row["SaT"]
+    out  = {}
+    # Song_2015
+    try:
+        out["Song_2015"] = np.exp(
+            -8.436 - 3.195*np.log(FC) - 0.346*np.log(FC)**2
+            + 1.579*np.log(K) + 0.393*np.log(FC)*np.log(K)
+            - 0.136*np.log(K)**2 + 1.542*np.log(E) + 0.112*0.1)
+    except: out["Song_2015"] = 0.0
+    # Jafarian_2019
+    try:
+        A1 = ((0.41-0.34*FC)/(0.02+FC)) + ((0.002+1.42*FC)/(0.003+FC))*Dr
+        A2 = ((0.24+0.381*FC)/(FC+FC)) + Dr
+        A3 = ((0.55-2.77*FC)/(0.005+FC)) + ((0.55-3.28*FC)/(0.11+FC))*Dr
+        A4 = ((0.55-3.28*FC)/(0.11+FC)) + Dr
+        out["Jafarian_2019"] = np.exp((A1/A2)*np.log(F/100) + (A3/A4))
+    except: out["Jafarian_2019"] = 0.0
+    # HL_2010
+    try:
+        out["HL_2010"] = 10**(0.788*np.log10(F/100) - 10.166*FC
+                              + 5.95*FC*np.log10(F/100) + 1.779 + 0.224)
+    except: out["HL_2010"] = 0.0
+    # SR09
+    try:
+        ratio = FC/D
+        out["SR09"] = np.exp(-1.56 - 4.58*FC - 20.84*ratio**2
+                             + 44.75*ratio**3 - 30.5*ratio**4
+                             - 0.64*np.log(D) + 1.55*np.log(E)
+                             + 0.405 + 0.524*ratio)
+    except: out["SR09"] = 0.0
+    # TS16
+    try:
+        ratio = FC/D
+        out["TS16"] = np.exp(6.4 - 8.374*ratio - 0.419*ratio**2
+                             + 6.366*ratio**3 - 7.031*ratio**4
+                             + 0.767*np.log(D) + 0.67*np.log(F/100))
+    except: out["TS16"] = 0.0
+    # Lashgari_2021
+    try:
+        c1 = 6.31*Dr**0.06; c2 = 9.89*Dr**0.04; c3 = 1.27*Dr**0.05
+        out["Lashgari_2021"] = np.exp(c1 - c2*np.exp(np.log(FC/D)/c3)
+                                      + np.log(FC*g))
+    except: out["Lashgari_2021"] = 0.0
+    # Youd_2002
+    try:
+        R_dist = R_v
+        out["Youd_2002"] = 10**(-16.213 + 1.532*M_v
+            - 1.406*np.log10(R_dist + 10**(0.89*M_v - 5.64))
+            - 0.012*R_dist + 0.338*np.log10(6*100/30.9)
+            + 3.413*np.log10(100 - 0.7)
+            - 0.795*np.log10(0.18 + 0.1)) * 100
+    except: out["Youd_2002"] = 0.0
+    return out
+
+# ─────────────────────────────────────────────
+# PINN (pure numpy, no pkl)
+# ─────────────────────────────────────────────
+class PhysicsInformedNN:
+    def __init__(self, hidden_layers=(64,32,16), lr=0.0005,
+                 epochs=600, batch_size=16, lambda_ts16=0.2, seed=42):
+        self.hidden_layers = hidden_layers
+        self.lr = lr; self.epochs = epochs
+        self.batch_size = batch_size
+        self.lambda_ts16 = lambda_ts16; self.seed = seed
+        self.weights = []; self.biases = []
+        self.mu = None; self.sigma = None
+
+    def _km_ts16(self, X):
+        D = X[:, RAW_FEATURES.index("Max_Acc")]
+        F = X[:, RAW_FEATURES.index("Arias")]
+        r = FC / np.clip(D, 1e-9, None)
+        val = np.exp(6.4 - 8.374*r - 0.419*r**2 + 6.366*r**3
+                     - 7.031*r**4 + 0.767*np.log(np.clip(D,1e-9,None))
+                     + 0.67*np.log(np.clip(F/100,1e-9,None)))
+        return np.log1p(np.clip(val, 0, None))
+
+    def _init_weights(self, n_in, rng):
+        sizes = [n_in] + list(self.hidden_layers) + [1]
+        self.weights = []
+        self.biases  = []
+        for i in range(len(sizes)-1):
+            fan_in = sizes[i]
+            self.weights.append(
+                rng.standard_normal((fan_in, sizes[i+1])) * np.sqrt(2/fan_in))
+            self.biases.append(np.zeros(sizes[i+1]))
+
+    def _forward(self, X):
+        activations = [X]
+        a = X
+        for i, (W, b) in enumerate(zip(self.weights, self.biases)):
+            z = a @ W + b
+            a = np.maximum(0, z) if i < len(self.weights)-1 else z
+            activations.append(a)
+        return a.flatten(), activations
+
+    def _backward(self, X, y, activations):
+        n = len(y)
+        y_pred = activations[-1].flatten()
+        delta  = 2*(y_pred - y) / n
+        grads_w = []; grads_b = []
+        for i in range(len(self.weights)-1, -1, -1):
+            a_in  = activations[i]
+            a_out = activations[i+1]
+            if i < len(self.weights)-1:
+                delta = delta * (a_out.flatten() > 0)
+            gw = a_in.T @ delta.reshape(-1,1)
+            gb = delta.sum(axis=0)
+            grads_w.insert(0, gw); grads_b.insert(0, gb)
+            delta = (delta.reshape(-1,1) @ self.weights[i].T).flatten()
+        return grads_w, grads_b
+
+    def fit(self, X, y):
+        rng = np.random.default_rng(self.seed)
+        self.mu    = X.mean(axis=0)
+        self.sigma = X.std(axis=0) + 1e-8
+        Xs = (X - self.mu) / self.sigma
+        self._init_weights(Xs.shape[1], rng)
+        n = len(y)
+        for ep in range(self.epochs):
+            idx = rng.permutation(n)
+            for start in range(0, n, self.batch_size):
+                b_idx = idx[start:start+self.batch_size]
+                Xb    = Xs[b_idx]; yb = y[b_idx]
+                y_pred, acts = self._forward(Xb)
+                # Data loss gradients
+                gw, gb = self._backward(Xb, yb, acts)
+                # Physics loss (TS16)
+                if self.lambda_ts16 > 0:
+                    km_target = self._km_ts16(X[b_idx])
+                    y_log     = np.log1p(np.clip(y_pred, 0, None))
+                    p_delta   = 2*(y_log - km_target) / len(b_idx)
+                    p_delta  *= 1.0 / (np.clip(y_pred, 0, None) + 1)
+                    p_delta  *= self.lambda_ts16
+                    pgw, pgb  = self._backward(Xb, y_pred - p_delta, acts)
+                    gw = [g + pg for g, pg in zip(gw, pgw)]
+                    gb = [g + pg for g, pg in zip(gb, pgb)]
+                # Update with gradient clipping
+                for i in range(len(self.weights)):
+                    self.weights[i] -= self.lr * np.clip(gw[i], -1, 1)
+                    self.biases[i]  -= self.lr * np.clip(gb[i], -1, 1)
+        return self
+
+    def predict(self, X):
+        Xs = (X - self.mu) / self.sigma
+        pred, _ = self._forward(Xs)
+        return np.clip(pred, 0, None)
+
+
+# ─────────────────────────────────────────────
+# DATA + MODEL TRAINING (cached)
+# ─────────────────────────────────────────────
+@st.cache_resource(show_spinner="Loading data and training models...")
+def load_and_train():
+    # ── Load data
+    df_raw = pd.read_excel(FILE_PATH, header=3)
+    col_map = {df_raw.columns[i]: name for i, name in enumerate(
+        ["Rec_No"] + RAW_FEATURES + ["Displacement"])}
+    df = df_raw.rename(columns=col_map).iloc[:, :15].dropna(
+        subset=["Displacement"]).reset_index(drop=True)
+
+    # ── Compute KM features
+    kms = df.apply(compute_all_kms, axis=1, result_type="expand")
+    for km in kms.columns:
+        df[f"KM_{km}"]     = kms[km].clip(lower=0)
+        df[f"KM_{km}_log"] = np.log1p(df[f"KM_{km}"])
+
+    X_raw = df[RAW_FEATURES].values
+    X_t1  = df[TOP6].values
+    X_t2  = df[TOP6 + ["KM_Song_2015_log"]].values
+    y     = df["Displacement"].values
+
+    # ── LOO-CV for Jackknife+ residuals
+    def get_loo_preds(model, X):
+        loo = LeaveOneOut()
+        preds = np.zeros(len(y))
+        for tr, te in loo.split(X):
+            m = type(model)(**model.get_params())
+            m.fit(X[tr], y[tr])
+            preds[te[0]] = m.predict(X[te])[0]
+        return preds
+
+    # Tier 1: GB Top 6
+    gb = GradientBoostingRegressor(n_estimators=200, max_depth=3,
+         learning_rate=0.05, subsample=0.8, random_state=42)
+    loo_t1 = get_loo_preds(gb, X_t1)
+    gb.fit(X_t1, y)
+    q_t1 = np.quantile(np.abs(y - loo_t1), 0.90)
+
+    # Tier 2: XGBoost + Song_2015
+    xgb = XGBRegressor(n_estimators=200, max_depth=4, learning_rate=0.05,
+          subsample=0.8, colsample_bytree=0.8,
+          tree_method="hist", random_state=42, verbosity=0)
+    loo_t2 = get_loo_preds(xgb, X_t2)
+    xgb.fit(X_t2, y)
+    q_t2 = np.quantile(np.abs(y - loo_t2), 0.90)
+
+    # Tier 3: PINN
+    pinn = PhysicsInformedNN(lambda_ts16=0.2, epochs=600)
+    loo_t3 = np.zeros(len(y))
+    for tr, te in LeaveOneOut().split(X_raw):
+        p = PhysicsInformedNN(lambda_ts16=0.2, epochs=600)
+        p.fit(X_raw[tr], y[tr])
+        loo_t3[te[0]] = p.predict(X_raw[te])[0]
+    pinn.fit(X_raw, y)
+    q_t3 = np.quantile(np.abs(y - loo_t3), 0.90)
+
+    # ── SHAP (full data)
+    explainer_t1 = shap.TreeExplainer(gb)
+    sv_t1 = explainer_t1.shap_values(pd.DataFrame(X_t1, columns=TOP6))
+
+    X_t2_df = pd.DataFrame(X_t2, columns=TOP6 + ["KM_Song_2015_log"])
+    explainer_t2 = shap.PermutationExplainer(xgb.predict, X_t2_df)
+    sv_t2 = explainer_t2(X_t2_df).values
+
+    return {
+        "df": df, "y": y,
+        "X_t1": X_t1, "X_t2": X_t2, "X_raw": X_raw,
+        "gb": gb, "xgb": xgb, "pinn": pinn,
+        "q_t1": q_t1, "q_t2": q_t2, "q_t3": q_t3,
+        "loo_t1": loo_t1, "loo_t2": loo_t2, "loo_t3": loo_t3,
+        "sv_t1": sv_t1, "sv_t2": sv_t2,
+    }
+
+
+# ─────────────────────────────────────────────
+# STREAMLIT APP
+# ─────────────────────────────────────────────
 st.set_page_config(
-    page_title="Seismic Displacement Predictor",
+    page_title="Seismic Lateral Displacement Predictor",
     page_icon="🌍",
-    layout="wide",
-    initial_sidebar_state="expanded",
+    layout="wide"
 )
 
-# ══════════════════════════════════════════════════════════════
-# LOAD ARTIFACTS  — everything derived from pkl, nothing hardcoded
-# ══════════════════════════════════════════════════════════════
-@st.cache_resource
-def load_artifacts():
-    with open("gb_model.pkl",      "rb") as f: model = pickle.load(f)
-    with open("feature_info.pkl",  "rb") as f: info  = pickle.load(f)
-    with open("training_data.pkl", "rb") as f: train = pickle.load(f)
-
-    # ── Authoritative feature list: always trust the model itself ──
-    model_feats = list(model.feature_names_in_)
-
-    # ── Derive which columns are raw inputs vs KM log features ──
-    km_log_cols = [c for c in model_feats if c.endswith("_log")]
-    raw_inputs  = [c for c in model_feats if not c.endswith("_log")]
-
-    # ── KM base names (strip _log suffix) ──
-    km_cols = [c.replace("_log", "") for c in km_log_cols]
-
-    # ── Training data aligned to model feature order ──
-    X_raw = train["X"]
-    y     = np.array(train["y"])
-    # Reindex to model's exact column order; fill any gaps with 0
-    X_aligned = X_raw.reindex(columns=model_feats, fill_value=0.0)
-
-    return model, info, X_aligned, y, model_feats, raw_inputs, km_cols, km_log_cols
-
-(model, info, X_train, y_train,
- MODEL_FEATS, RAW_INPUTS, KM_COLS, KM_LOG_COLS) = load_artifacts()
-
-# ══════════════════════════════════════════════════════════════
-# SHARED HELPERS
-# ══════════════════════════════════════════════════════════════
-def build_feature_row(inp: dict, km: dict) -> pd.DataFrame:
-    """
-    Build a single-row DataFrame matching MODEL_FEATS exactly.
-    inp : {raw_input_col: value}
-    km  : {km_base_name: value}  e.g. {"Jafarian_2019": 150.0}
-    """
-    row = {}
-    for col in RAW_INPUTS:
-        row[col] = float(inp.get(col, 0.0))
-    for col in KM_COLS:
-        row[f"{col}_log"] = np.log1p(float(km.get(col, 0.0)))
-    return pd.DataFrame([row])[MODEL_FEATS]
-
-
-def compute_loo_residuals():
-    """Compute LOO residuals once per session and cache in st.session_state."""
-    if "loo_residuals" not in st.session_state:
-        with st.spinner("Computing Jackknife+ calibration (one-time ~30s)..."):
-            n   = len(y_train)
-            Xt  = X_train.values
-            yt  = y_train.copy()
-            res = np.zeros(n)
-            for i in range(n):
-                m = GradientBoostingRegressor(**model.get_params())
-                m.fit(
-                    pd.DataFrame(np.delete(Xt, i, axis=0), columns=MODEL_FEATS),
-                    np.delete(yt, i)
-                )
-                res[i] = abs(
-                    yt[i] - m.predict(
-                        pd.DataFrame(Xt[i:i+1], columns=MODEL_FEATS)
-                    )[0]
-                )
-            st.session_state["loo_residuals"] = res
-
-
-def jackknife_interval(X_df: pd.DataFrame, alpha: float = 0.10):
-    """Return (point, lower, upper, q) using Jackknife+ intervals."""
-    compute_loo_residuals()
-    q     = np.quantile(st.session_state["loo_residuals"], 1 - alpha)
-    point = float(np.clip(model.predict(X_df)[0], 0, None))
-    lower = max(0.0, point - q)
-    upper = point + q
-    return point, lower, upper, q
-
-
-def uncertainty_color(cv: float) -> str:
-    if cv < 0.3: return "#16A34A"   # green
-    if cv < 0.6: return "#D97706"   # amber
-    return       "#DC2626"           # red
-
-
-# ══════════════════════════════════════════════════════════════
-# SIDEBAR
-# ══════════════════════════════════════════════════════════════
-st.sidebar.title("🌍 Seismic Displacement\nPredictor")
-st.sidebar.markdown("---")
-
-page = st.sidebar.radio("Navigation", [
-    "🔮  Single Prediction",
-    "📂  Batch Prediction",
-    "🧠  Model Explainability",
-    "ℹ️  About & Model Info",
-], label_visibility="collapsed")
-
-st.sidebar.markdown("---")
-st.sidebar.markdown(
-    f"**Model:** {info.get('model_name','Gradient Boosting')}  \n"
-    f"**LOO-CV R²:** {info.get('loo_r2','—')}  \n"
-    f"**RMSE:** {info.get('loo_rmse',0):.1f} cm  \n"
-    f"**JK+ Coverage:** {info.get('jk_coverage',0)*100:.1f}%  \n"
-    f"**Features:** {len(MODEL_FEATS)}  \n"
-    f"**Training samples:** {len(y_train)}"
+st.sidebar.image(
+    "https://www.floridapoly.edu/wp-content/uploads/2019/07/FPU_Primary_Logo_RGB.png",
+    width=200
 )
+st.sidebar.title("Navigation")
+page = st.sidebar.radio("Go to", [
+    "🔮 Single Prediction",
+    "📊 Model Comparison",
+    "🔍 Explainability",
+    "ℹ️ About"
+])
 
+# Load models
+data = load_and_train()
+df   = data["df"]
+y    = data["y"]
 
-# ══════════════════════════════════════════════════════════════
-# PAGE 1 — SINGLE PREDICTION
-# ══════════════════════════════════════════════════════════════
-if "Single" in page:
-    st.title("🔮 Single Record Prediction")
+# ══════════════════════════════════════════════════════════════════
+# PAGE 1: SINGLE PREDICTION
+# ══════════════════════════════════════════════════════════════════
+if page == "🔮 Single Prediction":
+    st.title("🔮 Seismic Lateral Displacement Prediction")
     st.markdown(
-        "Enter ground motion parameters and (optionally) empirical model "
-        "predictions. Returns a **point estimate** with a "
-        "**Jackknife+ prediction interval**."
+        "Enter the 13 seismic intensity measures below. "
+        "All three model tiers run automatically and predictions are shown side by side."
     )
 
-    # ── Raw input fields (generated dynamically from RAW_INPUTS) ──
-    st.markdown("### Ground Motion Input Parameters")
-
-    # Sensible defaults and ranges per variable name
-    INPUT_CONFIG = {
-        "M":        ("Magnitude (M)",               2.0,  10.0,   7.0,  0.1 ),
-        "R":        ("Distance R (km)",              0.1, 100.0,   5.0,  0.5 ),
-        "Max_Acc":  ("Max Acceleration (g)",         0.0,   5.0,   0.4,  0.01),
-        "Max_Vel":  ("Max Velocity (cm/s)",          0.0,1000.0,  80.0,  1.0 ),
-        "Arias":    ("Arias Intensity (cm/s)",       0.0,5000.0, 200.0,  1.0 ),
-        "Char_Int": ("Characteristic Intensity",     0.0,   5.0,   0.1,  0.01),
-        "CAV":      ("CAV (cm/s)",                   0.0,10000.0,1200.0,10.0 ),
-        "Housner":  ("Housner Intensity (cm)",       0.0,1000.0, 180.0,  1.0 ),
-        "Sa_avg":   ("Sa,avg (g)",                   0.0,   5.0,   0.5,  0.01),
-        "SaT":      ("SaT@1.5 (g)",                  0.0,   5.0,   0.8,  0.01),
-        "Ia_Du":    ("Ia/Du",                        0.0, 500.0,  20.0,  0.5 ),
-        "ru_max_ave":("ru_max_ave",                  0.0,  10.0,   1.0,  0.01),
-        "Shear_strain":("Shear Strain (%)",          0.0,  50.0,   2.0,  0.1 ),
-    }
-
+    st.subheader("Input Features")
     cols = st.columns(3)
-    inp  = {}
-    for i, col_name in enumerate(RAW_INPUTS):
-        cfg = INPUT_CONFIG.get(col_name, (col_name, 0.0, 1e6, 0.0, 0.1))
-        label, mn, mx, default, step = cfg
-        inp[col_name] = cols[i % 3].number_input(label, mn, mx, default, step)
-
-    # ── Empirical model predictions ──
-    st.markdown("### Empirical Model Predictions (cm)")
-    st.caption("Leave as 0 if unavailable — raw inputs alone are sufficient.")
-
-    KM_LABELS = {
-        "Song_2015":     "Song & Rodriguez-Marek 2015",
-        "Jafarian_2019": "Jafarian et al. 2019",
-        "HL_2010":       "HL 2010",
-        "SR09":          "SR09",
-        "TS16":          "TS16",
-        "Lashgari_2021": "Lashgari et al. 2021",
-        "Youd_2002":     "Youd 2002",
-    }
-
-    km = {}
-    km_cols_ui = st.columns(min(len(KM_COLS), 4))
-    for i, col_name in enumerate(KM_COLS):
-        label = KM_LABELS.get(col_name, col_name)
-        km[col_name] = km_cols_ui[i % 4].number_input(
-            label, 0.0, 100000.0, 0.0, 1.0, key=f"km_{col_name}"
+    user_inputs = {}
+    for i, feat in enumerate(RAW_FEATURES):
+        mn, mx, step = FEATURE_RANGES[feat]
+        user_inputs[feat] = cols[i % 3].number_input(
+            FEATURE_LABELS[feat],
+            min_value=float(mn), max_value=float(mx),
+            value=float(FEATURE_DEFAULTS[feat]),
+            step=float(step), format="%.4f"
         )
 
-    pi_levels   = [0.10, 0.05]
-    alpha_v     = st.selectbox(
-        "Prediction interval level",
-        pi_levels,
-        format_func=lambda x: f"{int((1-x)*100)}%"
-    )
+    if st.button("▶ Predict Displacement", type="primary"):
+        row = pd.Series(user_inputs)
 
-    if st.button("🚀 Predict Displacement", type="primary", use_container_width=True):
-        X_new = build_feature_row(inp, km)
-        point, lower, upper, q = jackknife_interval(X_new, alpha=alpha_v)
-        cv    = (upper - lower) / (2 * point + 1e-9)
-        color = uncertainty_color(cv)
-        pct   = int((1 - alpha_v) * 100)
+        # Compute Song_2015 KM for Tier 2
+        song_val = compute_song2015(**user_inputs)
+        song_log = np.log1p(max(song_val, 0))
+
+        x_t1  = np.array([[user_inputs[f] for f in TOP6]])
+        x_t2  = np.array([[user_inputs[f] for f in TOP6] + [song_log]])
+        x_raw = np.array([[user_inputs[f] for f in RAW_FEATURES]])
+
+        pred_t1 = float(data["gb"].predict(x_t1)[0])
+        pred_t2 = float(data["xgb"].predict(x_t2)[0])
+        pred_t3 = float(data["pinn"].predict(x_raw)[0])
+
+        q1, q2, q3 = data["q_t1"], data["q_t2"], data["q_t3"]
 
         st.markdown("---")
-        st.markdown("### Prediction Results")
+        st.subheader("Prediction Results")
 
-        r1, r2, r3, r4 = st.columns(4)
-        r1.metric("Predicted Displacement", f"{point:.1f} cm")
-        r2.metric(f"Lower Bound ({pct}% PI)", f"{lower:.1f} cm")
-        r3.metric(f"Upper Bound ({pct}% PI)", f"{upper:.1f} cm")
-        r4.metric("Interval Width",           f"{upper-lower:.1f} cm")
+        c1, c2, c3 = st.columns(3)
+        for col, label, pred, q, color, note in [
+            (c1, "Tier 1: GB Top 6\n(Baseline ML)",
+             pred_t1, q1, "#2196F3", "6 SHAP-selected features"),
+            (c2, "Tier 2: XGB + Song_2015\n(Knowledge-Augmented)",
+             pred_t2, q2, "#FF5722", "Song_2015 auto-computed"),
+            (c3, "Tier 3: PINN TS16 λ=0.2\n(Physics-Informed NN)",
+             pred_t3, q3, "#4CAF50", "Physics-constrained training"),
+        ]:
+            col.markdown(f"**{label}**")
+            col.metric("Predicted Displacement",
+                       f"{pred:.1f} cm",
+                       delta=f"90% PI: [{max(0,pred-q):.1f}, {pred+q:.1f}] cm")
+            col.caption(note)
 
-        unc = ("🟢 Low" if cv < 0.3 else "🟡 Moderate" if cv < 0.6 else "🔴 High")
-        st.progress(min(cv, 1.0), text=f"Uncertainty: {unc}  (CV = {cv:.2f})")
+        # Bar chart comparison
+        fig, ax = plt.subplots(figsize=(8, 4))
+        preds  = [pred_t1, pred_t2, pred_t3]
+        qs     = [q1, q2, q3]
+        labels = ["Tier 1\nGB Top 6", "Tier 2\nXGB+Song", "Tier 3\nPINN"]
+        colors = ["#2196F3", "#FF5722", "#4CAF50"]
+        bars = ax.bar(labels, preds, color=colors, alpha=0.85,
+                      edgecolor="white", width=0.5)
+        ax.errorbar(labels, preds, yerr=qs, fmt="none",
+                    color="black", capsize=8, linewidth=2)
+        for bar, p in zip(bars, preds):
+            ax.text(bar.get_x() + bar.get_width()/2, p + 2,
+                    f"{p:.1f} cm", ha="center", fontsize=11, fontweight="bold")
+        ax.set_ylabel("Predicted Displacement (cm)", fontsize=11)
+        ax.set_title("Three-Tier Prediction Comparison\n(error bars = 90% Jackknife+ PI)",
+                     fontsize=11)
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+        st.pyplot(fig)
+        plt.close()
 
-        # Interval bar
-        fig, ax = plt.subplots(figsize=(9, 1.8))
-        ax.barh([""], [upper - lower], left=[lower], color=color,
-                alpha=0.30, height=0.5, label=f"{pct}% PI")
-        ax.plot([point], [0], "o", color=color, markersize=12,
-                label="Point estimate", zorder=5)
-        ax.set_xlabel("Displacement (cm)")
-        ax.set_xlim(0, max(upper * 1.2, 10))
-        ax.legend(fontsize=9); ax.set_yticks([])
-        ax.spines[["top","right","left"]].set_visible(False)
-        plt.tight_layout()
-        st.pyplot(fig, use_container_width=True); plt.close()
-
-        # Comparison with empirical models
-        emp_vals = {KM_LABELS.get(k, k): v for k, v in km.items() if v > 0}
-        if emp_vals:
-            st.markdown("#### Comparison with Empirical Models")
-            fig2, ax2 = plt.subplots(figsize=(9, max(3, len(emp_vals) * 0.6 + 1)))
-            names  = list(emp_vals.keys()) + ["▶ ML Hybrid (this model)"]
-            values = list(emp_vals.values()) + [point]
-            colors = ["#94A3B8"] * len(emp_vals) + [color]
-            bars   = ax2.barh(names, values, color=colors, edgecolor="white")
-            ax2.bar_label(bars, fmt="%.1f", padding=4, fontsize=9)
-            ax2.set_xlabel("Predicted Displacement (cm)")
-            ax2.spines[["top","right"]].set_visible(False)
-            plt.tight_layout()
-            st.pyplot(fig2, use_container_width=True); plt.close()
-        else:
-            st.info("Enter empirical model predictions above to see a comparison chart.")
-
-
-# ══════════════════════════════════════════════════════════════
-# PAGE 2 — BATCH PREDICTION
-# ══════════════════════════════════════════════════════════════
-elif "Batch" in page:
-    st.title("📂 Batch Prediction")
-    st.markdown(
-        "Upload a **CSV or Excel** file. "
-        "Download results with predictions and 90% Jackknife+ intervals."
-    )
-
-    # Template: all raw inputs + all KM columns
-    template_cols = RAW_INPUTS + KM_COLS
-    tdf = pd.DataFrame(columns=template_cols)
-    tdf.loc[0] = [0.0] * len(template_cols)
-    buf = io.BytesIO()
-    tdf.to_excel(buf, index=False)
-    st.download_button(
-        "⬇️ Download Input Template (.xlsx)", buf.getvalue(),
-        "input_template.xlsx",
-        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-    )
-
-    st.markdown("---")
-    uploaded = st.file_uploader("Upload file (CSV or Excel)", type=["csv","xlsx","xls"])
-
-    if uploaded is not None:
-        try:
-            df_up = (pd.read_csv(uploaded) if uploaded.name.endswith(".csv")
-                     else pd.read_excel(uploaded))
-            st.success(f"✅ {len(df_up)} records loaded  |  {df_up.shape[1]} columns")
-            st.dataframe(df_up.head(5), use_container_width=True)
-
-            # Fill any missing columns with 0
-            missing = [c for c in template_cols if c not in df_up.columns]
-            if missing:
-                st.warning(f"⚠️ Missing columns filled with 0: {missing}")
-                for c in missing:
-                    df_up[c] = 0.0
-
-            if st.button("🚀 Run Batch Prediction", type="primary"):
-                # Build feature matrix from uploaded data
-                df_proc = df_up.copy()
-                for km_col in KM_COLS:
-                    df_proc[f"{km_col}_log"] = np.log1p(df_proc[km_col].fillna(0))
-
-                # Align to model's exact feature order
-                X_batch = df_proc.reindex(columns=MODEL_FEATS, fill_value=0.0)
-                preds   = np.clip(model.predict(X_batch), 0, None)
-                df_up["Pred_Displacement_cm"] = np.round(preds, 2)
-
-                # Jackknife+ intervals
-                compute_loo_residuals()
-                q90 = np.quantile(st.session_state["loo_residuals"], 0.90)
-                df_up["PI_Lower_90"] = np.round(np.clip(preds - q90, 0, None), 2)
-                df_up["PI_Upper_90"] = np.round(preds + q90, 2)
-                df_up["PI_Width"]    = np.round(
-                    df_up["PI_Upper_90"] - df_up["PI_Lower_90"], 2
-                )
-
-                # Show results
-                res_cols = (
-                    [c for c in ["Rec_No","M","R"] if c in df_up.columns] +
-                    ["Pred_Displacement_cm","PI_Lower_90","PI_Upper_90","PI_Width"]
-                )
-                st.markdown("### Results")
-                st.dataframe(df_up[res_cols], use_container_width=True)
-
-                sc1, sc2, sc3, sc4 = st.columns(4)
-                sc1.metric("Mean", f"{preds.mean():.1f} cm")
-                sc2.metric("Std",  f"{preds.std():.1f} cm")
-                sc3.metric("Min",  f"{preds.min():.1f} cm")
-                sc4.metric("Max",  f"{preds.max():.1f} cm")
-
-                fig, ax = plt.subplots(figsize=(9, 3.5))
-                ax.hist(preds, bins=20, color="#2563EB", edgecolor="white", alpha=0.85)
-                ax.set_xlabel("Predicted Displacement (cm)")
-                ax.set_ylabel("Count")
-                ax.set_title("Distribution of Predicted Displacements")
-                ax.spines[["top","right"]].set_visible(False)
-                plt.tight_layout()
-                st.pyplot(fig, use_container_width=True); plt.close()
-
-                out = io.BytesIO()
-                df_up.to_excel(out, index=False)
-                st.download_button(
-                    "⬇️ Download Results (.xlsx)", out.getvalue(),
-                    "predictions_output.xlsx",
-                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    type="primary"
-                )
-
-        except Exception as e:
-            st.error(f"❌ Error: {e}")
+        st.info(
+            f"**Song_2015 auto-computed value:** {song_val:.3f} cm "
+            f"(log-transformed input to Tier 2: {song_log:.4f})"
+        )
 
 
-# ══════════════════════════════════════════════════════════════
-# PAGE 3 — EXPLAINABILITY
-# ══════════════════════════════════════════════════════════════
-elif "Explainability" in page:
-    st.title("🧠 Model Explainability (SHAP)")
-    st.markdown(
-        "SHAP values quantify each feature's contribution to predictions.  \n"
-        "**Positive SHAP** → pushes predicted displacement **higher**.  \n"
-        "**Negative SHAP** → pushes predicted displacement **lower**."
-    )
+# ══════════════════════════════════════════════════════════════════
+# PAGE 2: MODEL COMPARISON
+# ══════════════════════════════════════════════════════════════════
+elif page == "📊 Model Comparison":
+    st.title("📊 Model Performance Comparison")
+    st.markdown("LOO-CV results across all model configurations. ★ = best per tier.")
 
-    @st.cache_resource
-    def compute_shap_values():
-        exp  = shap.TreeExplainer(model)
-        vals = exp.shap_values(X_train)
-        return exp, vals
+    results_data = {
+        "Tier": ["Empirical", "Tier 1", "Tier 1", "Tier 1",
+                 "Tier 2", "Tier 3", "Tier 3", "Tier 3"],
+        "Model": [
+            "HL_2010 (best empirical)",
+            "GB — All 13 features", "GB — Top 6 (SHAP) ★", "RF — Top 6 (SHAP)",
+            "XGB — Top 6 + Song_2015 ★",
+            "NN — Baseline (13 raw)", "PINN — TS16 λ=0.2 ★", "PINN — Best 3 KM",
+        ],
+        "R²":   [-7.18, 0.714, 0.733, 0.730, 0.738, 0.712, 0.721, 0.720],
+        "RMSE (cm)": [114.7, 21.45, 20.72, 20.83, 20.52, 21.51, 21.20, 21.23],
+        "MAE (cm)":  [75.3,  13.39, 13.13, 13.40, 12.57, 14.73, 14.50, 14.62],
+        "Coverage (%)": ["—", "—", "89.3", "—", "89.3", "—", "89.3", "—"],
+        "PI Width (cm)": ["—", "—", "56.7", "—", "56.9", "—", "69.9", "—"],
+    }
+    df_res = pd.DataFrame(results_data)
+    st.dataframe(df_res, use_container_width=True, hide_index=True)
 
-    with st.spinner("Computing SHAP values..."):
-        explainer, shap_vals = compute_shap_values()
+    # RMSE bar chart (excluding empirical)
+    st.subheader("RMSE Comparison (ML Models Only)")
+    df_ml = df_res[df_res["Tier"] != "Empirical"].copy()
+    fig, ax = plt.subplots(figsize=(10, 5))
+    bar_colors = {
+        "Tier 1": "#2196F3", "Tier 2": "#FF5722", "Tier 3": "#4CAF50"
+    }
+    colors = [bar_colors.get(t, "#999") for t in df_ml["Tier"]]
+    bars = ax.bar(range(len(df_ml)), df_ml["RMSE (cm)"],
+                  color=colors, alpha=0.85, edgecolor="white")
+    ax.set_xticks(range(len(df_ml)))
+    ax.set_xticklabels(df_ml["Model"], rotation=25, ha="right", fontsize=9)
+    ax.set_ylabel("RMSE (cm)")
+    ax.set_title("LOO-CV RMSE Across All ML Configurations")
+    ax.axhline(y=20.52, color="#FF5722", linestyle="--",
+               linewidth=1.2, label="Best: XGB+Song_2015 (20.52 cm)")
+    ax.legend(); ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    for bar, v in zip(bars, df_ml["RMSE (cm)"]):
+        ax.text(bar.get_x() + bar.get_width()/2, v + 0.1,
+                f"{v:.2f}", ha="center", fontsize=8)
+    st.pyplot(fig); plt.close()
 
-    tab1, tab2, tab3 = st.tabs(
-        ["📊 Feature Importance", "🐝 Beeswarm", "📈 Dependence Plots"]
-    )
+    # LOO-CV Predicted vs Observed
+    st.subheader("LOO-CV: Predicted vs Observed")
+    fig, axes = plt.subplots(1, 3, figsize=(16, 5))
+    for ax, (label, yt, yp, color) in zip(axes, [
+        ("Tier 1: GB Top 6",        y, data["loo_t1"], "#2196F3"),
+        ("Tier 2: XGB + Song_2015", y, data["loo_t2"], "#FF5722"),
+        ("Tier 3: PINN TS16 λ=0.2", y, data["loo_t3"], "#4CAF50"),
+    ]):
+        r2   = r2_score(yt, yp)
+        rmse = np.sqrt(mean_squared_error(yt, yp))
+        ax.scatter(yt, yp, alpha=0.75, s=45, color=color,
+                   edgecolors="white", linewidths=0.5)
+        lim = max(yt.max(), yp.max()) * 1.05
+        ax.plot([0, lim], [0, lim], "k--", linewidth=1.2, label="1:1")
+        ax.set_xlim(0, lim); ax.set_ylim(0, lim)
+        ax.set_xlabel("Observed (cm)"); ax.set_ylabel("Predicted (cm)")
+        ax.set_title(f"{label}\nR²={r2:.3f}  RMSE={rmse:.1f} cm",
+                     fontweight="bold", fontsize=10)
+        ax.legend(fontsize=8)
+    plt.tight_layout()
+    st.pyplot(fig); plt.close()
+
+
+# ══════════════════════════════════════════════════════════════════
+# PAGE 3: EXPLAINABILITY
+# ══════════════════════════════════════════════════════════════════
+elif page == "🔍 Explainability":
+    st.title("🔍 Model Explainability — SHAP Analysis")
+
+    tab1, tab2, tab3 = st.tabs([
+        "Tier 1: GB Top 6", "Tier 2: XGB + Song_2015", "CAV Dependence"
+    ])
 
     with tab1:
-        st.markdown("#### Global Feature Importance — Mean |SHAP Value|")
-        mean_abs = np.abs(shap_vals).mean(axis=0)
-        feat_ord = np.argsort(mean_abs)
-        fig, ax  = plt.subplots(figsize=(9, max(5, len(MODEL_FEATS) * 0.4)))
-        bars = ax.barh(
-            [MODEL_FEATS[i] for i in feat_ord],
-            mean_abs[feat_ord],
-            color="#2563EB", edgecolor="white"
-        )
-        ax.bar_label(bars, fmt="%.2f", padding=4, fontsize=9)
-        ax.set_xlabel("Mean |SHAP value| (cm)")
-        ax.set_title(f"Feature Importance — {info.get('model_name','Gradient Boosting')}")
-        ax.spines[["top","right"]].set_visible(False)
-        plt.tight_layout()
-        st.pyplot(fig, use_container_width=True); plt.close()
+        st.subheader("SHAP Feature Importance — Tier 1: GB Top 6")
+        sv_t1 = data["sv_t1"]
+        mean_abs_t1 = np.abs(sv_t1).mean(axis=0)
+        sorted_idx  = np.argsort(mean_abs_t1)
+        sorted_f    = [TOP6[i] for i in sorted_idx]
+        sorted_v    = mean_abs_t1[sorted_idx]
 
-        # Top 3 features from data
-        top3 = [MODEL_FEATS[i] for i in feat_ord[::-1][:3]]
-        st.info(f"**Top features:** {', '.join(top3)}")
+        fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+        # Bar
+        axes[0].barh(range(6), sorted_v, color="#2196F3",
+                     alpha=0.85, edgecolor="white")
+        axes[0].set_yticks(range(6)); axes[0].set_yticklabels(sorted_f)
+        axes[0].set_xlabel("Mean |SHAP value| (cm)")
+        axes[0].set_title("Feature Importance", fontweight="bold")
+        for i, v in enumerate(sorted_v):
+            axes[0].text(v + 0.1, i, f"{v:.2f}", va="center", fontsize=9)
+        # Beeswarm
+        X_t1_df = pd.DataFrame(data["X_t1"], columns=TOP6)
+        feat_order = X_t1_df.abs().mean().sort_values(ascending=True).index.tolist()
+        for i, feat in enumerate(feat_order):
+            vals   = sv_t1[:, TOP6.index(feat)]
+            feat_v = data["X_t1"][:, TOP6.index(feat)]
+            norm   = (feat_v - feat_v.min()) / (feat_v.max() - feat_v.min() + 1e-9)
+            jitter = np.random.default_rng(42).uniform(-0.2, 0.2, len(vals))
+            sc = axes[1].scatter(vals, i + jitter, c=norm, cmap="coolwarm",
+                                 alpha=0.7, s=25, vmin=0, vmax=1)
+        axes[1].set_yticks(range(6))
+        axes[1].set_yticklabels(feat_order)
+        axes[1].axvline(0, color="black", linewidth=0.8, linestyle="--")
+        axes[1].set_xlabel("SHAP value (cm)")
+        axes[1].set_title("Beeswarm Plot", fontweight="bold")
+        plt.colorbar(sc, ax=axes[1], label="Feature value\n(blue=low, red=high)")
+        plt.tight_layout(); st.pyplot(fig); plt.close()
+
+        st.info(
+            "**CAV (Cumulative Absolute Velocity)** is the dominant predictor "
+            "across all three models, reflecting its role as the primary "
+            "measure of total seismic energy input to the soil — the key "
+            "driver of pore-pressure buildup and liquefaction-induced displacement."
+        )
 
     with tab2:
-        st.markdown("#### SHAP Beeswarm Plot")
-        st.caption("Each dot = one sample. Color = feature value (🔴 high / 🔵 low).")
-        fig, ax = plt.subplots(figsize=(10, max(6, len(MODEL_FEATS) * 0.45)))
-        plt.sca(ax)
-        shap.summary_plot(shap_vals, X_train, plot_type="dot",
-                          max_display=len(MODEL_FEATS), show=False)
-        plt.tight_layout()
-        st.pyplot(fig, use_container_width=True); plt.close()
+        st.subheader("SHAP Feature Importance — Tier 2: XGB + Song_2015")
+        sv_t2     = data["sv_t2"]
+        T2_FEATS  = TOP6 + ["KM_Song_2015_log"]
+        feat_labels = ["Song_2015 (auto)" if f == "KM_Song_2015_log"
+                       else f for f in T2_FEATS]
+        mean_abs_t2 = np.abs(sv_t2).mean(axis=0)
+        sorted_idx  = np.argsort(mean_abs_t2)
+        sorted_f    = [feat_labels[i] for i in sorted_idx]
+        sorted_v    = mean_abs_t2[sorted_idx]
+
+        fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+        axes[0].barh(range(7), sorted_v, color="#FF5722",
+                     alpha=0.85, edgecolor="white")
+        axes[0].set_yticks(range(7)); axes[0].set_yticklabels(sorted_f)
+        axes[0].set_xlabel("Mean |SHAP value| (cm)")
+        axes[0].set_title("Feature Importance", fontweight="bold")
+        for i, v in enumerate(sorted_v):
+            axes[0].text(v + 0.1, i, f"{v:.2f}", va="center", fontsize=9)
+        # Beeswarm
+        for i, feat in enumerate(sorted_f):
+            orig_idx = feat_labels.index(feat)
+            vals     = sv_t2[:, orig_idx]
+            feat_v   = data["X_t2"][:, orig_idx]
+            norm     = (feat_v - feat_v.min()) / (feat_v.max() - feat_v.min() + 1e-9)
+            jitter   = np.random.default_rng(42).uniform(-0.2, 0.2, len(vals))
+            sc = axes[1].scatter(vals, i + jitter, c=norm, cmap="coolwarm",
+                                 alpha=0.7, s=25, vmin=0, vmax=1)
+        axes[1].set_yticks(range(7)); axes[1].set_yticklabels(sorted_f)
+        axes[1].axvline(0, color="black", linewidth=0.8, linestyle="--")
+        axes[1].set_xlabel("SHAP value (cm)")
+        axes[1].set_title("Beeswarm Plot", fontweight="bold")
+        plt.colorbar(sc, ax=axes[1], label="Feature value\n(blue=low, red=high)")
+        plt.tight_layout(); st.pyplot(fig); plt.close()
+
+        st.info(
+            "**Song_2015** ranks last in SHAP importance (1.25 cm) yet improves "
+            "RMSE by 0.58 cm — it contributes through nonlinear interaction "
+            "effects in XGBoost's ensemble structure, encoding velocity- and "
+            "spectral-period-dependent scaling not captured by the six raw features."
+        )
 
     with tab3:
-        st.markdown("#### SHAP Dependence Plot")
-        st.caption("How SHAP value varies with feature value. "
-                   "Color by a second feature to reveal interaction effects.")
-        col_a, col_b = st.columns(2)
-        default_x = MODEL_FEATS.index("CAV") if "CAV" in MODEL_FEATS else 0
-        default_c = MODEL_FEATS.index("Arias") if "Arias" in MODEL_FEATS else 1
-        feat_sel  = col_a.selectbox("Feature (x-axis)", MODEL_FEATS, index=default_x)
-        color_sel = col_b.selectbox("Color by",         MODEL_FEATS, index=default_c)
-        fi = MODEL_FEATS.index(feat_sel)
-        ci = MODEL_FEATS.index(color_sel)
-        fig, ax = plt.subplots(figsize=(8, 5))
-        sc = ax.scatter(
-            X_train.iloc[:, fi], shap_vals[:, fi],
-            c=X_train.iloc[:, ci], cmap="RdYlBu_r",
-            alpha=0.75, s=55, edgecolors="white", linewidth=0.3
-        )
-        ax.axhline(0, color="black", lw=0.8, linestyle="--")
-        ax.set_xlabel(feat_sel, fontsize=11)
-        ax.set_ylabel("SHAP value", fontsize=11)
-        ax.set_title(f"Dependence: {feat_sel}  (color = {color_sel})")
-        ax.spines[["top","right"]].set_visible(False)
-        plt.colorbar(sc, ax=ax, label=color_sel, pad=0.02)
-        plt.tight_layout()
-        st.pyplot(fig, use_container_width=True); plt.close()
+        st.subheader("CAV Dependence Plot — Tier 1 vs Tier 2")
+        cav_idx  = TOP6.index("CAV")
+        cav_vals = data["X_t1"][:, cav_idx]
+        sv_cav_t1 = data["sv_t1"][:, cav_idx]
+        sv_cav_t2 = data["sv_t2"][:, cav_idx]
 
+        fig, ax = plt.subplots(figsize=(9, 5))
+        ax.scatter(cav_vals, sv_cav_t1, alpha=0.75, s=45, color="#2196F3",
+                   label="Tier 1: GB Top 6", edgecolors="white", linewidths=0.4)
+        ax.scatter(cav_vals, sv_cav_t2, alpha=0.75, s=45, color="#FF5722",
+                   label="Tier 2: XGB+Song", edgecolors="white",
+                   linewidths=0.4, marker="s")
+        ax.axhline(0, color="black", linewidth=0.8, linestyle="--")
+        ax.set_xlabel("CAV (cm/s)", fontsize=11)
+        ax.set_ylabel("SHAP value for CAV (cm)", fontsize=11)
+        ax.set_title("CAV SHAP Dependence — Tier 1 vs Tier 2", fontweight="bold")
+        ax.legend(fontsize=10)
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+        plt.tight_layout(); st.pyplot(fig); plt.close()
 
-# ══════════════════════════════════════════════════════════════
-# PAGE 4 — ABOUT
-# ══════════════════════════════════════════════════════════════
-elif "About" in page:
-    st.title("ℹ️ About This Tool")
-    st.markdown(f"""
-    ## Seismic-Induced Displacement Predictor
-
-    Predicts **seismic-induced lateral displacement** using a
-    **hybrid machine learning model** combining:
-    - **{len(RAW_INPUTS)} ground motion intensity measures** (raw inputs)
-    - **{len(KM_COLS)} knowledge-based empirical model outputs** (log-transformed)
-
-    Trained on high-fidelity numerical simulation data
-    (n = {len(y_train)} records), validated with Leave-One-Out CV.
-    """)
-
-    st.markdown("---")
-    c1, c2 = st.columns(2)
-
-    with c1:
-        st.markdown("### 🏆 Model Performance (LOO-CV)")
-        km_metrics = info.get("km_metrics", {})
-        rows = [{
-            "Model": f"{info.get('model_name','GB')} ✅",
-            "R²":       info.get("loo_r2",  "—"),
-            "RMSE (cm)": info.get("loo_rmse","—"),
-            "MAE (cm)":  info.get("loo_mae", "—"),
-        }]
-        for km_name, m in km_metrics.items():
-            rows.append({
-                "Model":     km_name,
-                "R²":        round(m.get("R2",   0), 3),
-                "RMSE (cm)": round(m.get("RMSE", 0), 1),
-                "MAE (cm)":  "—",
-            })
-        perf_df = pd.DataFrame(rows)
-        st.dataframe(perf_df, use_container_width=True, hide_index=True)
-
-        best_km_rmse = min(m["RMSE"] for m in km_metrics.values()) if km_metrics else 1
-        ml_rmse      = info.get("loo_rmse", 1)
-        improvement  = (best_km_rmse - ml_rmse) / best_km_rmse * 100
-        st.success(f"ML hybrid reduces RMSE by **{improvement:.0f}%** vs best empirical model.")
-
-    with c2:
-        st.markdown("### 🎯 Jackknife+ Uncertainty Quantification")
-        cov     = info.get("jk_coverage", 0)
-        width   = info.get("jk_width",    0)
-        n       = len(y_train)
-        alpha   = 0.10
-        min_cov = (1 - alpha) * (1 + 1/n)
-        st.metric("Empirical Coverage (90% PI)", f"{cov*100:.1f}%",
-                  delta=f"Target ≥ {min_cov*100:.1f}%")
-        st.metric("Mean Interval Width", f"{width:.1f} cm")
-        st.markdown(f"""
-        **Jackknife+** (Barber et al., 2021) provides finite-sample,
-        distribution-free intervals with theoretical guarantees.
-
-        For n={n}, α=0.10:
-        > Minimum coverage = (1−α)(1+1/n) = **{min_cov*100:.1f}%**
-
-        Achieved: **{cov*100:.1f}%** {'✅' if cov >= min_cov else '⚠️'}
-        """)
-
-    st.markdown("---")
-    st.markdown(f"### 📥 Model Features ({len(MODEL_FEATS)} total)")
-    feat_rows = []
-    for feat in MODEL_FEATS:
-        if feat in RAW_INPUTS:
-            feat_rows.append({"Feature": feat, "Type": "Raw Input",
-                              "Note": "Direct ground motion measurement"})
-        else:
-            base = feat.replace("_log","")
-            feat_rows.append({"Feature": feat, "Type": "Hybrid (KM)",
-                              "Note": f"log(1 + {base} prediction)"})
-    st.dataframe(pd.DataFrame(feat_rows), use_container_width=True, hide_index=True)
-
-    dropped = info.get("dropped_features", [])
-    if dropped:
-        st.markdown("### 🗑️ Dropped Features (near-zero SHAP importance)")
-        st.dataframe(
-            pd.DataFrame({"Dropped Feature": dropped,
-                          "Reason": ["Near-zero SHAP importance"] * len(dropped)}),
-            use_container_width=True, hide_index=True
+        st.markdown(
+            "High CAV values (red zone, >2000 cm/s) consistently push predicted "
+            "displacement upward with SHAP contributions exceeding +30 cm, "
+            "while low CAV suppresses predictions below the baseline expectation. "
+            "The nonlinear threshold effect is consistent across both model families."
         )
 
-    st.markdown("---")
-    st.markdown("### 📚 References")
+
+# ══════════════════════════════════════════════════════════════════
+# PAGE 4: ABOUT
+# ══════════════════════════════════════════════════════════════════
+elif page == "ℹ️ About":
+    st.title("ℹ️ About This Application")
+
     st.markdown("""
-    - Barber et al. (2021). *Predictive Inference with the Jackknife+*. Ann. Statistics.
-    - Jafarian et al. (2019). *Empirical seismic displacement model*.
-    - Haskell & Lacasse (2010). *HL empirical displacement model*.
-    - Youd et al. (2002). *Revised multilinear regression equations*.
-    - Song & Rodriguez-Marek (2015). *Probabilistic seismic displacement model*.
-    - Lashgari et al. (2021). *Seismic displacement prediction model*.
+    ### Three-Tier Hybrid ML Framework for Seismic Lateral Displacement
+
+    This application implements a three-tier hybrid machine learning framework
+    developed to predict **seismic-induced lateral displacement (cm)** from
+    13 standard ground motion intensity measures. All models are trained
+    on n = 75 numerical simulation records and evaluated using
+    **Leave-One-Out Cross-Validation (LOO-CV)**.
     """)
-    st.caption("Built with Python · scikit-learn · SHAP · Streamlit")
+
+    st.markdown("---")
+    st.markdown("### The Three Tiers")
+
+    col1, col2, col3 = st.columns(3)
+    col1.markdown("""
+    **🔵 Tier 1 — Baseline ML**
+    - Gradient Boosting Regressor
+    - Top 6 features selected by SHAP
+    - R² = 0.733 | RMSE = 20.72 cm
+    - Most interpretable; no formula needed
+    """)
+    col2.markdown("""
+    **🟠 Tier 2 — Knowledge-Augmented ML**
+    - XGBoost + Song_2015 (auto-computed)
+    - Best point-prediction accuracy
+    - R² = 0.738 | RMSE = 20.52 cm
+    - Song_2015 computed internally from inputs
+    """)
+    col3.markdown("""
+    **🟢 Tier 3 — Physics-Informed NN**
+    - Neural network (64→32→16)
+    - TS16 physics loss constraint (λ=0.2)
+    - R² = 0.721 | RMSE = 21.20 cm
+    - No formula evaluation at inference time
+    """)
+
+    st.markdown("---")
+    st.markdown("### Key Findings")
+    st.markdown("""
+    - All three tiers converge to R² ≈ 0.72–0.74, suggesting an
+      **information ceiling** for this simulation dataset
+    - **CAV** is the dominant predictor across all model families
+      (consensus SHAP rank = 1)
+    - SHAP-guided feature selection (13 → 6 features) improves
+      generalization in small-sample settings (n = 75)
+    - Empirical formulas fail stand-alone (best R² = −7.18) but
+      provide complementary signal when integrated into ML
+    - Jackknife+ prediction intervals achieve **89.3% empirical coverage**
+      at the 90% nominal level across all three tiers
+    """)
+
+    st.markdown("---")
+    st.markdown("### Input Features Used")
+    feat_df = pd.DataFrame({
+        "Feature": list(FEATURE_LABELS.keys()),
+        "Description": list(FEATURE_LABELS.values()),
+        "SHAP Rank (consensus)": [6, 7, 11, 9, 2, 12, 1, 4, 5, 10, 8, 13, 3]
+    })
+    st.dataframe(feat_df, use_container_width=True, hide_index=True)
+
+    st.markdown("---")
+    st.markdown("""
+    **Developed by:** Dr. Parisa Hajibabaee | Florida Polytechnic University
+
+    **Citation:** *(manuscript in preparation)*
+
+    **Note:** All models train on startup from the dataset file.
+    LOO-CV is used for all reported metrics. Jackknife+ intervals
+    are evaluated on held-out LOO predictions (not in-sample).
+    """)
+
+
