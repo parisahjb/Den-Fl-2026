@@ -168,62 +168,93 @@ class PhysicsInformedNN:
     def _init_weights(self, n_in, rng):
         sizes = [n_in] + list(self.hidden_layers) + [1]
         self.weights = []; self.biases = []
-        for i in range(len(sizes)-1):
+        for i in range(len(sizes) - 1):
             fan_in = sizes[i]
             self.weights.append(
-                rng.standard_normal((fan_in, sizes[i+1])) * np.sqrt(2/fan_in))
-            self.biases.append(np.zeros(sizes[i+1]))
+                rng.standard_normal((fan_in, sizes[i+1])) * np.sqrt(2.0 / fan_in))
+            self.biases.append(np.zeros((1, sizes[i+1])))
 
     def _forward(self, X):
-        activations = [X]; a = X
+        # X shape: (batch, features)
+        activations = [X]
+        a = X
         for i, (W, b) in enumerate(zip(self.weights, self.biases)):
-            z = a @ W + b
-            a = np.maximum(0, z) if i < len(self.weights)-1 else z
+            z = a @ W + b          # (batch, out)
+            a = np.maximum(0, z) if i < len(self.weights) - 1 else z
             activations.append(a)
-        return a.flatten(), activations
+        return a.reshape(-1), activations  # flatten output to 1D
 
-    def _backward(self, X, y, activations):
-        n = len(y)
-        y_pred = activations[-1].flatten()
-        delta  = 2*(y_pred - y) / n
-        grads_w = []; grads_b = []
-        for i in range(len(self.weights)-1, -1, -1):
-            a_in  = activations[i]
-            a_out = activations[i+1]
-            if i < len(self.weights)-1:
-                delta = delta * (a_out.flatten() > 0)
-            gw = a_in.T @ delta.reshape(-1, 1)
-            gb = delta.sum(axis=0)
-            grads_w.insert(0, gw); grads_b.insert(0, gb)
-            delta = (delta.reshape(-1, 1) @ self.weights[i].T).flatten()
+    def _backward(self, activations, y_true):
+        # y_true: 1D array of length batch
+        n      = len(y_true)
+        y_pred = activations[-1].reshape(-1)          # (batch,)
+        # gradient of MSE w.r.t. output layer
+        delta  = (2.0 / n) * (y_pred - y_true)        # (batch,)
+        delta  = delta.reshape(-1, 1)                  # (batch, 1)
+
+        grads_w = [None] * len(self.weights)
+        grads_b = [None] * len(self.biases)
+
+        for i in range(len(self.weights) - 1, -1, -1):
+            a_in  = activations[i]                     # (batch, in)
+            a_out = activations[i + 1]                 # (batch, out)
+            # ReLU derivative for hidden layers
+            if i < len(self.weights) - 1:
+                delta = delta * (a_out > 0)            # (batch, out)
+            grads_w[i] = a_in.T @ delta                # (in, out)
+            grads_b[i] = delta.sum(axis=0, keepdims=True)  # (1, out)
+            delta = delta @ self.weights[i].T          # (batch, in)
+
         return grads_w, grads_b
 
     def fit(self, X, y):
         rng = np.random.default_rng(self.seed)
         self.mu    = X.mean(axis=0)
         self.sigma = X.std(axis=0) + 1e-8
-        Xs = (X - self.mu) / self.sigma
+        Xs = (X - self.mu) / self.sigma                # (n, features)
         self._init_weights(Xs.shape[1], rng)
         n = len(y)
+
         for ep in range(self.epochs):
             idx = rng.permutation(n)
             for start in range(0, n, self.batch_size):
-                b_idx = idx[start:start+self.batch_size]
-                Xb = Xs[b_idx]; yb = y[b_idx]
+                b_idx = idx[start:start + self.batch_size]
+                Xb    = Xs[b_idx]                      # (batch, features)
+                yb    = y[b_idx]                       # (batch,)
+
+                # Forward + backward for data loss
                 y_pred, acts = self._forward(Xb)
-                gw, gb = self._backward(Xb, yb, acts)
+                gw, gb = self._backward(acts, yb)
+
+                # Physics loss (TS16)
                 if self.lambda_ts16 > 0:
-                    km_target = self._km_ts16(X[b_idx])
+                    km_target = self._km_ts16(X[b_idx])         # (batch,)
                     y_log     = np.log1p(np.clip(y_pred, 0, None))
-                    p_delta   = 2*(y_log - km_target) / len(b_idx)
-                    p_delta  *= 1.0 / (np.clip(y_pred, 0, None) + 1)
-                    p_delta  *= self.lambda_ts16
-                    pgw, pgb  = self._backward(Xb, y_pred - p_delta, acts)
+                    # gradient of physics MSE w.r.t. y_pred
+                    p_grad    = (2.0 * self.lambda_ts16 / len(b_idx)) * \
+                                (y_log - km_target) / \
+                                (np.clip(y_pred, 0, None) + 1.0)  # (batch,)
+                    # backprop physics gradient as additional output delta
+                    phys_delta = p_grad.reshape(-1, 1)            # (batch,1)
+                    # reuse activations, only output layer delta differs
+                    pgw = [None] * len(self.weights)
+                    pgb = [None] * len(self.weights)
+                    delta = phys_delta
+                    for i in range(len(self.weights) - 1, -1, -1):
+                        a_in  = acts[i]
+                        a_out = acts[i + 1]
+                        if i < len(self.weights) - 1:
+                            delta = delta * (a_out > 0)
+                        pgw[i] = a_in.T @ delta
+                        pgb[i] = delta.sum(axis=0, keepdims=True)
+                        delta  = delta @ self.weights[i].T
                     gw = [g + pg for g, pg in zip(gw, pgw)]
                     gb = [g + pg for g, pg in zip(gb, pgb)]
+
+                # Update with gradient clipping
                 for i in range(len(self.weights)):
-                    self.weights[i] -= self.lr * np.clip(gw[i], -1, 1)
-                    self.biases[i]  -= self.lr * np.clip(gb[i], -1, 1)
+                    self.weights[i] -= self.lr * np.clip(gw[i], -1.0, 1.0)
+                    self.biases[i]  -= self.lr * np.clip(gb[i], -1.0, 1.0)
         return self
 
     def predict(self, X):
