@@ -362,6 +362,7 @@ st.sidebar.image(
 st.sidebar.title("Navigation")
 page = st.sidebar.radio("Go to", [
     "🔮 Single Prediction",
+    "📂 Batch Prediction",
     "📊 Model Comparison",
     "🔍 Explainability",
     "ℹ️ About"
@@ -498,7 +499,195 @@ if page == "🔮 Single Prediction":
                 "(best standalone R² = −7.18) but provide complementary "
                 "signal when integrated into ML models.")
 
+# ══════════════════════════════════════════════════════════════════
+# PAGE 2: BATCH PREDICTION
+# ══════════════════════════════════════════════════════════════════
+elif page == "📂 Batch Prediction":
+    st.title("📂 Batch Prediction")
+    st.markdown(
+        "Upload a CSV or Excel file containing multiple records. "
+        "The file must include the 13 input feature columns listed below. "
+        "All three model tiers will run on every row and results can be downloaded."
+    )
 
+    # ── Template download
+    with st.expander("📋 Required column names (click to expand)"):
+        st.markdown(
+            "Your file must contain these exact column headers "
+            "(order does not matter):"
+        )
+        st.code(", ".join(RAW_FEATURES))
+        # Build a one-row template dataframe
+        template_df = pd.DataFrame([FEATURE_DEFAULTS])
+        csv_template = template_df.to_csv(index=False)
+        st.download_button(
+            label="⬇ Download blank template (CSV)",
+            data=csv_template,
+            file_name="seismic_batch_template.csv",
+            mime="text/csv"
+        )
+
+    # ── File upload
+    uploaded = st.file_uploader(
+        "Upload your file (.csv or .xlsx)",
+        type=["csv", "xlsx"]
+    )
+
+    if uploaded is not None:
+        # Load uploaded file
+        try:
+            if uploaded.name.endswith(".xlsx"):
+                df_up = pd.read_excel(uploaded)
+            else:
+                df_up = pd.read_csv(uploaded)
+        except Exception as e:
+            st.error(f"Could not read file: {e}")
+            st.stop()
+
+        # Check required columns
+        missing_cols = [f for f in RAW_FEATURES if f not in df_up.columns]
+        if missing_cols:
+            st.error(
+                f"The following required columns are missing from your file: "
+                f"{', '.join(missing_cols)}"
+            )
+            st.stop()
+
+        st.success(f"File loaded: {len(df_up)} records detected.")
+        st.dataframe(df_up[RAW_FEATURES].head(5), use_container_width=True)
+
+        if st.button("▶ Run Batch Prediction", type="primary"):
+            with st.spinner("Running predictions on all records..."):
+
+                results = []
+                for i, row in df_up.iterrows():
+                    # ── Tier 1
+                    x_t1 = np.array([[row[f] for f in TOP6]])
+                    pred_t1 = float(data["gb"].predict(x_t1)[0])
+
+                    # ── Tier 2 — compute Song_2015
+                    try:
+                        E = row["Max_Vel"]; K = row["SaT"]
+                        song_val = np.exp(
+                            -8.436 - 3.195*np.log(FC) - 0.346*np.log(FC)**2
+                            + 1.579*np.log(K) + 0.393*np.log(FC)*np.log(K)
+                            - 0.136*np.log(K)**2 + 1.542*np.log(E) + 0.112*0.1)
+                        song_val = max(song_val, 0)
+                    except:
+                        song_val = 0.0
+                    song_log = np.log1p(song_val)
+                    x_t2 = pd.DataFrame(
+                        [[row[f] for f in TOP6] + [song_log]],
+                        columns=data["T2_FEATS"]
+                    )
+                    pred_t2 = float(data["xgb"].predict(x_t2)[0])
+
+                    # ── Tier 3
+                    x_raw = np.array([[row[f] for f in RAW_FEATURES]])
+                    pred_t3 = float(data["pinn"].predict(x_raw)[0])
+
+                    results.append({
+                        "Record": i + 1,
+                        # Pass through any ID column if present
+                        **({col: row[col]} if col in df_up.columns
+                           else {} for col in ["Rec_No", "ID", "id", "Name"]
+                           if col in df_up.columns),
+                        # Tier 1
+                        "T1_Pred (cm)":  round(pred_t1, 2),
+                        "T1_PI_Lower":   round(max(0, pred_t1 - Q_T1), 2),
+                        "T1_PI_Upper":   round(pred_t1 + Q_T1, 2),
+                        # Tier 2
+                        "T2_Pred (cm)":  round(pred_t2, 2),
+                        "T2_PI_Lower":   round(max(0, pred_t2 - Q_T2), 2),
+                        "T2_PI_Upper":   round(pred_t2 + Q_T2, 2),
+                        # Tier 3
+                        "T3_Pred (cm)":  round(pred_t3, 2),
+                        "T3_PI_Lower":   round(max(0, pred_t3 - Q_T3), 2),
+                        "T3_PI_Upper":   round(pred_t3 + Q_T3, 2),
+                    })
+
+            df_results = pd.DataFrame(results)
+
+            st.markdown("---")
+            st.subheader(f"Results — {len(df_results)} records")
+            st.dataframe(df_results, use_container_width=True, hide_index=True)
+
+            # ── Summary statistics
+            st.markdown("#### Prediction Summary")
+            c1, c2, c3 = st.columns(3)
+            for col, label, color in [
+                (c1, "Tier 1: GB Top 6",        "#2196F3"),
+                (c2, "Tier 2: XGB + Song_2015",  "#FF5722"),
+                (c3, "Tier 3: PINN TS16 λ=0.2",  "#4CAF50"),
+            ]:
+                key = {"Tier 1: GB Top 6":        "T1_Pred (cm)",
+                       "Tier 2: XGB + Song_2015":  "T2_Pred (cm)",
+                       "Tier 3: PINN TS16 λ=0.2":  "T3_Pred (cm)"}[label]
+                vals = df_results[key]
+                col.markdown(f"**{label}**")
+                col.metric("Mean prediction",  f"{vals.mean():.1f} cm")
+                col.metric("Min / Max",
+                           f"{vals.min():.1f} / {vals.max():.1f} cm")
+
+            # ── Distribution plot
+            fig, ax = plt.subplots(figsize=(10, 4))
+            bins = 20
+            ax.hist(df_results["T1_Pred (cm)"], bins=bins, alpha=0.6,
+                    color="#2196F3", label="Tier 1: GB")
+            ax.hist(df_results["T2_Pred (cm)"], bins=bins, alpha=0.6,
+                    color="#FF5722", label="Tier 2: XGB+Song")
+            ax.hist(df_results["T3_Pred (cm)"], bins=bins, alpha=0.6,
+                    color="#4CAF50", label="Tier 3: PINN")
+            ax.set_xlabel("Predicted Displacement (cm)", fontsize=11)
+            ax.set_ylabel("Count", fontsize=11)
+            ax.set_title("Distribution of Batch Predictions — All Three Tiers",
+                         fontweight="bold")
+            ax.legend(fontsize=10)
+            ax.spines["top"].set_visible(False)
+            ax.spines["right"].set_visible(False)
+            plt.tight_layout()
+            st.pyplot(fig)
+            plt.close()
+
+            # ── Download buttons
+            st.markdown("#### Download Results")
+            c1, c2 = st.columns(2)
+
+            csv_out = df_results.to_csv(index=False)
+            c1.download_button(
+                label="⬇ Download as CSV",
+                data=csv_out,
+                file_name="seismic_predictions.csv",
+                mime="text/csv"
+            )
+
+            # Excel download
+            import io
+            buffer = io.BytesIO()
+            with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+                df_results.to_excel(writer, index=False, sheet_name="Predictions")
+                # Add a summary sheet
+                summary = pd.DataFrame({
+                    "Model": ["Tier 1: GB Top 6",
+                              "Tier 2: XGB + Song_2015",
+                              "Tier 3: PINN TS16 λ=0.2"],
+                    "LOO-CV R²":   [0.733, 0.738, 0.721],
+                    "LOO-CV RMSE": [20.72, 20.52, 21.20],
+                    "PI Width (cm)":[56.7,  56.9,  69.9],
+                    "Coverage (%)": [89.3,  89.3,  89.3],
+                })
+                summary.to_excel(writer, index=False, sheet_name="Model Summary")
+            c2.download_button(
+                label="⬇ Download as Excel",
+                data=buffer.getvalue(),
+                file_name="seismic_predictions.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            )
+
+            st.caption(
+                "PI Lower/Upper = 90% Jackknife+ prediction interval bounds. "
+                "T1/T2/T3 = Tier 1 / Tier 2 / Tier 3 respectively."
+            )
 # ══════════════════════════════════════════════════════════════════
 # PAGE 2: MODEL COMPARISON
 # ══════════════════════════════════════════════════════════════════
