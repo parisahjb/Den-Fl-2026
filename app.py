@@ -465,10 +465,15 @@ if page == "Single Prediction":
             "Prediction intervals are **asymmetric** (back-transformed from log space)."
         )
 
-    st.subheader("Input Features")
+    # ── Core features (Top 6 — always visible)
+    ADVANCED = ["R", "Max_Acc", "Max_Vel", "Char_Int", "SaT", "Ia_Du", "ru_max_ave"]
+    CORE     = [f for f in RAW_FEATURES if f not in ADVANCED]
+
+    st.subheader("Core Input Features")
+    st.caption("These 6 features drive all three tiers. Required for all predictions.")
     cols = st.columns(3)
     user_inputs = {}
-    for i, feat in enumerate(RAW_FEATURES):
+    for i, feat in enumerate(CORE):
         mn, mx, step = FEATURE_RANGES[feat]
         user_inputs[feat] = cols[i % 3].number_input(
             FEATURE_LABELS[feat],
@@ -476,6 +481,26 @@ if page == "Single Prediction":
             value=float(FEATURE_DEFAULTS[feat]),
             step=float(step), format="%.4f"
         )
+
+    # ── Advanced features (low SHAP importance — collapsed by default)
+    with st.expander(
+        "Advanced Input Features — lower SHAP importance "
+        "(required for Tier 2 Song_2015 and Tier 3 PINN full feature set)",
+        expanded=False
+    ):
+        st.caption(
+            "Max_Vel and SaT are used to auto-compute Song_2015 for Tier 2. "
+            "All 7 are used as additional inputs to the Tier 3 PINN."
+        )
+        adv_cols = st.columns(3)
+        for i, feat in enumerate(ADVANCED):
+            mn, mx, step = FEATURE_RANGES[feat]
+            user_inputs[feat] = adv_cols[i % 3].number_input(
+                FEATURE_LABELS[feat],
+                min_value=float(mn), max_value=float(mx),
+                value=float(FEATURE_DEFAULTS[feat]),
+                step=float(step), format="%.4f"
+            )
 
     if st.button("Run Prediction", type="primary"):
         p1, p2, p3, pi1, pi2, pi3, song_val = predict_all_tiers(
@@ -947,7 +972,6 @@ elif page == "About":
     - Standard LOO scatter computed on demand (button on Model Comparison page).
     - PINN lognormal LOO metrics pending offline computation.
     """)
-
 # # ── app.py — Seismic Lateral Displacement Prediction (Three-Tier Hybrid ML)
 # # ── Parisa Hajibabaee | Florida Polytechnic University
 
