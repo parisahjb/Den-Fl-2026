@@ -502,6 +502,14 @@ if page == "Single Prediction":
                 step=float(step), format="%.4f"
             )
 
+    st.warning(
+        "**Note:** If you did not open the Advanced Input Features box above, "
+        "**default placeholder values** are used for Tier 2 and Tier 3. "
+        "Only **Tier 1 (GB Top 6)** relies exclusively on your 6 core inputs. "
+        "For accurate Tier 2 and Tier 3 predictions, please open the box "
+        "and enter your own values."
+    )
+
     if st.button("Run Prediction", type="primary"):
         p1, p2, p3, pi1, pi2, pi3, song_val = predict_all_tiers(
             user_inputs, data, use_log)
